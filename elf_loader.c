@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include <elf.h>
 
-#define DEV_PATH "/dev/vfio_bridge_dma"
+#define DEV_PATH "/dev/gvsoc"
 #define DMA_CHUNK_SIZE 4096U
 
 #define DMA_STATUS_BUSY  (1u << 0)
@@ -22,6 +22,10 @@
 
 #define DMA_DIR_HOST_TO_CARD 0u
 #define DMA_DIR_CARD_TO_HOST 1u
+
+/* BAR0 CSRs exposed by the VFIO bridge */
+#define BAR0_ENTRY_POINT   0x28u
+#define BAR0_FETCH_ENABLE  0x2Cu
 
 struct vfio_bridge_dma_info {
     uint64_t dma_addr;
@@ -39,9 +43,16 @@ struct vfio_bridge_dma_submit {
     uint32_t reserved;
 };
 
-#define VFIO_BRIDGE_IOC_MAGIC  'V'
-#define VFIO_BRIDGE_IOC_GET_INFO  _IOR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
-#define VFIO_BRIDGE_IOC_SUBMIT    _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x02, struct vfio_bridge_dma_submit)
+/* New generic BAR0 write ioctl payload */
+struct vfio_bridge_bar0_write32 {
+    uint32_t offset;
+    uint32_t value;
+};
+
+#define VFIO_BRIDGE_IOC_MAGIC       'V'
+#define VFIO_BRIDGE_IOC_GET_INFO    _IOR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
+#define VFIO_BRIDGE_IOC_SUBMIT      _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x02, struct vfio_bridge_dma_submit)
+#define VFIO_BRIDGE_IOC_BAR0_WRITE32 _IOW(VFIO_BRIDGE_IOC_MAGIC, 0x03, struct vfio_bridge_bar0_write32)
 
 typedef struct {
     uint64_t entry;
@@ -70,17 +81,37 @@ static void dump_submit_result(const char *tag, const struct vfio_bridge_dma_sub
            !!(req->status & DMA_STATUS_ERROR));
 }
 
-static uint64_t remap_card_addr(uint64_t elf_paddr, uint64_t base_addr, int seg_idx)
+static uint64_t remap_card_addr(uint64_t elf_addr, uint64_t base_addr, int seg_idx)
 {
-    if (elf_paddr < base_addr) {
-        fprintf(stderr,
-                "Segment %d has p_paddr=0x%016" PRIx64
-                " which is below base_addr=0x%016" PRIx64 "\n",
-                seg_idx, elf_paddr, base_addr);
+    if (elf_addr < base_addr) {
+        if (seg_idx >= 0) {
+            fprintf(stderr,
+                    "Segment %d has paddr=0x%016" PRIx64
+                    " which is below base_addr=0x%016" PRIx64 "\n",
+                    seg_idx, elf_addr, base_addr);
+        } else {
+            fprintf(stderr,
+                    "Entry point 0x%016" PRIx64
+                    " is below base_addr=0x%016" PRIx64 "\n",
+                    elf_addr, base_addr);
+        }
         exit(EXIT_FAILURE);
     }
 
-    return elf_paddr - base_addr;
+    return elf_addr - base_addr;
+}
+
+static void bar0_write32(int fd, uint32_t offset, uint32_t value)
+{
+    struct vfio_bridge_bar0_write32 req;
+
+    memset(&req, 0, sizeof(req));
+    req.offset = offset;
+    req.value  = value;
+
+    if (ioctl(fd, VFIO_BRIDGE_IOC_BAR0_WRITE32, &req) < 0) {
+        die_perror("ioctl(BAR0_WRITE32)");
+    }
 }
 
 static void dma_h2c_submit(int fd, uint64_t card_addr, uint32_t len, uint32_t timeout_ms)
@@ -346,11 +377,24 @@ static void load_elf_via_dma(const char *elf_path,
     munmap(file_base, (size_t)st.st_size);
 }
 
+static void program_entry_and_start(int fd, const elf_info_t *elf_info)
+{
+    printf("Programming BAR0 entry point:\n");
+    printf("  ELF entry        = 0x%016" PRIx64 "\n", elf_info->entry);
+
+    bar0_write32(fd, BAR0_ENTRY_POINT, (uint32_t)elf_info->entry);
+
+    printf("Programming BAR0 fetch enable:\n");
+    printf("  fetch_enable     = 1\n");
+
+    bar0_write32(fd, BAR0_FETCH_ENABLE, 1u);
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s <program.elf> <base_addr> [device] [timeout_ms]\n"
-            "  base_addr  address removed from ELF p_paddr before DMA write\n"
+            "  base_addr  address removed from ELF p_paddr and e_entry before programming/loading\n"
             "             example: 0xC0000000\n"
             "  device     default: %s\n"
             "  timeout_ms default: 5000\n",
@@ -418,7 +462,10 @@ int main(int argc, char **argv)
     printf("ELF load completed. entry=0x%016" PRIx64 " (%s)\n",
            elf_info.entry,
            elf_info.is_32 ? "ELF32" : "ELF64");
-    printf("Note: entry point parsed only; BAR0 start/entry programming intentionally deferred.\n");
+
+    program_entry_and_start(fd, &elf_info);
+
+    printf("Program start sequence completed.\n");
 
     munmap(map, info.size);
     close(fd);

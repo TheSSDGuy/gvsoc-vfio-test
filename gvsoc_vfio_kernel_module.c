@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Minimal host-side PCI driver for the vfio-user DMA bridge.
+ * Minimal host-side PCI driver for the GVSoC vfio-user DMA bridge.
  *
  * Features:
  * - Binds to the custom PCI endpoint
  * - Maps BAR0 (DMA control BAR)
- * - Allocates one coherent DMA buffer for host<->card transfers
+ * - Allocates one coherent DMA buffer for host <-> device-local transfers
  * - Uses MSI-X completion instead of BAR polling
  * - Exposes a miscdevice /dev/vfio_bridge_dma
  * - Supports mmap() of the coherent buffer into userspace
  * - Supports ioctls to get buffer info and submit a DMA transfer
  *
- * This is intentionally minimal and single-device oriented.
+ * This driver is intentionally minimal and single-device oriented.
  */
 
 #include <linux/completion.h>
@@ -29,8 +29,8 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#define DRV_NAME            "vfio_bridge_host_dma_driver"
-#define DEV_NAME            "vfio_bridge_dma"
+#define DRV_NAME            "gvsoc_vfio_kernel_module"
+#define DEV_NAME            "gvsoc"
 #define DMA_BUFFER_SIZE     (1U << 12)
 #define DMA_TIMEOUT_MS      5000
 
@@ -53,6 +53,8 @@
 #define BAR0_DMA_ERROR       0x1c
 #define BAR0_DMA_MAGIC       0x20
 #define BAR0_DMA_DIRECTION   0x24
+#define BAR0_ENTRY_POINT     0x28
+#define BAR0_FETCH_ENABLE    0x2C
 
 #define DMA_CTRL_START   BIT(0)
 #define DMA_CTRL_ABORT   BIT(1)
@@ -74,16 +76,22 @@ struct vfio_bridge_dma_info {
 struct vfio_bridge_dma_submit {
     __u32 direction;
     __u32 timeout_ms;
-    __u64 card_addr;
+    __u64 device_addr; /* device-local memory offset, not a PCI BAR address */
     __u32 len;
     __u32 status;
     __u32 error;
     __u32 reserved;
 };
 
-#define VFIO_BRIDGE_IOC_MAGIC  'V'
+struct vfio_bridge_bar0_write32 {
+    __u32 offset;
+    __u32 value;
+};
+
+#define VFIO_BRIDGE_IOC_MAGIC     'V'
 #define VFIO_BRIDGE_IOC_GET_INFO  _IOR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
 #define VFIO_BRIDGE_IOC_SUBMIT    _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x02, struct vfio_bridge_dma_submit)
+#define VFIO_BRIDGE_IOC_BAR0_WRITE32 _IOW(VFIO_BRIDGE_IOC_MAGIC, 0x03, struct vfio_bridge_bar0_write32)
 
 struct vfio_bridge_dev {
     struct pci_dev *pdev;
@@ -144,7 +152,8 @@ static int vfio_bridge_submit_dma(struct vfio_bridge_dev *d,
     unsigned long wait_ret;
     u32 ctrl;
 
-    if (req->direction != DMA_DIR_HOST_TO_CARD && req->direction != DMA_DIR_CARD_TO_HOST)
+    if (req->direction != DMA_DIR_HOST_TO_CARD &&
+        req->direction != DMA_DIR_CARD_TO_HOST)
         return -EINVAL;
 
     if (req->len == 0 || req->len > d->dma_size)
@@ -158,9 +167,9 @@ static int vfio_bridge_submit_dma(struct vfio_bridge_dev *d,
 
     if (req->direction == DMA_DIR_HOST_TO_CARD) {
         vfio_bridge_bar0_write64(d, BAR0_DMA_SRC_ADDR_LO, (u64)d->dma_handle);
-        vfio_bridge_bar0_write64(d, BAR0_DMA_DST_ADDR_LO, req->card_addr);
+        vfio_bridge_bar0_write64(d, BAR0_DMA_DST_ADDR_LO, req->device_addr);
     } else {
-        vfio_bridge_bar0_write64(d, BAR0_DMA_SRC_ADDR_LO, req->card_addr);
+        vfio_bridge_bar0_write64(d, BAR0_DMA_SRC_ADDR_LO, req->device_addr);
         vfio_bridge_bar0_write64(d, BAR0_DMA_DST_ADDR_LO, (u64)d->dma_handle);
     }
 
@@ -227,6 +236,26 @@ static long vfio_bridge_unlocked_ioctl(struct file *filp, unsigned int cmd, unsi
         if (copy_to_user((void __user *)arg, &req, sizeof(req)))
             return -EFAULT;
         return ret;
+    }
+    case VFIO_BRIDGE_IOC_BAR0_WRITE32:
+    {
+        struct vfio_bridge_bar0_write32 req;
+
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+            return -EFAULT;
+
+        switch (req.offset) {
+        case BAR0_ENTRY_POINT:
+        case BAR0_FETCH_ENABLE:
+            break;
+        default:
+            return -EINVAL;
+        }
+
+        mutex_lock(&d->lock);
+        vfio_bridge_bar0_write32(d, req.offset, req.value);
+        mutex_unlock(&d->lock);
+        return 0;
     }
     default:
         return -ENOTTY;
@@ -364,4 +393,4 @@ module_pci_driver(vfio_bridge_pci_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lorenzo workflow");
-MODULE_DESCRIPTION("Host DMA driver for GVSoC vfio-user PCI bridge with MSI-X completion");
+MODULE_DESCRIPTION("Host DMA driver for GVSoC vfio-user PCI bridge with private device memory and MSI-X completion");
