@@ -11,7 +11,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define DEV_PATH "/dev/vfio_bridge_dma"
+#define DEV_PATH "/dev/gvsoc"
 #define DEFAULT_LEN 4096U
 #define DEFAULT_CARD_ADDR 0U
 

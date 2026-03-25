@@ -1,237 +1,238 @@
 # GVSoC VFIO Test Environment
 
-This repository contains the **host-side infrastructure** used to interact with the GVSoC PCIe VFIO bridge.
+## Overview
+
+This repository contains the **host-side software stack** used to validate the GVSoC PCIe VFIO bridge from a Linux guest running inside QEMU.
 
 It includes:
 
-* Linux kernel module
-* DMA tests
-* ELF loader
-* Build scripts
+- a minimal **Linux PCI driver** for the custom VFIO-user endpoint
+- a **DMA round-trip test**
+- an **ELF loader** that programs memory and starts execution through BAR0
+- a simple **Makefile** to build and load everything
+
+The repository is meant to be used together with the `pcie_vfio_bridge` model in GVSoC.
 
 ---
 
-# Repository Structure
+## Repository Layout
 
-```
+```text
 Makefile
-vfio_bridge_host_dma_driver.c
-vfio_bridge_dma_test.c
-vfio_bridge_elf_loader.c
+gvsoc_vfio_kernel_module.c
+dma_test.c
+elf_loader.c
+README.md
 ```
 
-## Makefile
+### `gvsoc_vfio_kernel_module.c`
 
-The Makefile builds:
+Minimal guest-side PCI driver for the custom endpoint exposed by the GVSoC bridge.
 
-* the **kernel module**
-* the **test utilities**
+Main responsibilities:
 
-Typical commands:
+- bind to the PCI device identified by vendor `0x1d1d` and device `0x0001`
+- map **BAR0**
+- allocate one coherent DMA buffer
+- use **MSI-X** to detect DMA completion
+- expose a miscdevice to userspace
+- support `mmap()` of the DMA buffer and a few control `ioctl`s
 
-```
+Supported ioctls:
+
+- `VFIO_BRIDGE_IOC_GET_INFO`: return DMA buffer address and size
+- `VFIO_BRIDGE_IOC_SUBMIT`: submit one DMA request
+- `VFIO_BRIDGE_IOC_BAR0_WRITE32`: write a 32-bit BAR0 register from userspace
+
+### `dma_test.c`
+
+Userspace round-trip DMA validation tool.
+
+What it does:
+
+1. open the miscdevice
+2. query DMA buffer information
+3. `mmap()` the DMA buffer
+4. write a known pattern into host memory
+5. submit a **host-to-card** DMA
+6. clear the host buffer
+7. submit a **card-to-host** DMA
+8. compare the returned data with the original pattern
+
+This is the quickest way to validate the DMA path end-to-end.
+
+### `elf_loader.c`
+
+Userspace ELF loader using the same kernel driver and DMA path.
+
+What it does:
+
+- parse an ELF32 or ELF64 image
+- remap each loadable segment address by subtracting a user-provided base address
+- copy segment payloads to device memory through DMA
+- zero-initialize the `memsz - filesz` tail when needed
+- program `BAR0_ENTRY_POINT`
+- program `BAR0_FETCH_ENABLE = 1`
+
+This is the tool used to load and start code on the accelerator side through the PCIe bridge.
+
+### `Makefile`
+
+Build targets:
+
+```bash
 make
+make module
+make dma_test
+make elf_loader
 make load
 make unload
+make reload
+make clean
 ```
+
+Behavior:
+
+- `make` builds kernel module and userspace binaries
+- `make load` loads the module with `insmod`
+- `make unload` removes it with `rmmod`
 
 ---
 
-# Kernel Module
+## Build
 
-File:
+Inside the guest VM:
 
-```
-vfio_bridge_host_dma_driver.c
-```
-
-Responsibilities:
-
-* exposes the VFIO PCI device to userspace
-* configures **DMA buffers**
-* handles **ioctl commands**
-* allows user programs to control DMA
-
-The driver allocates DMA buffers and exposes them to user applications through `mmap`.
-
----
-
-# DMA Test
-
-File:
-
-```
-vfio_bridge_dma_test.c
-```
-
-This program performs a **DMA transfer test** between the host memory and the simulated device.
-
-Steps:
-
-1. open the VFIO device
-2. map the DMA buffer
-3. write test data
-4. trigger DMA
-5. verify the result
-
-Used to validate the **data path between QEMU and GVSoC**.
-
----
-
-# ELF Loader
-
-File:
-
-```
-vfio_bridge_elf_loader.c
-```
-
-This program loads an **ELF binary into the simulated device memory**.
-
-Responsibilities:
-
-* parse ELF headers
-* read program segments
-* write segments through PCIe BAR
-* optionally apply address remapping
-
-Used to boot programs inside the simulated accelerator.
-
----
-
-# QEMU Setup
-
-## 1 — Build QEMU
-
-Clone and compile:
-
-```
-git clone https://github.com/qemu/qemu
-cd qemu
-./configure --target-list=x86_64-softmmu
-make -j8
-```
-
----
-
-## 2 — Download Debian image
-
-```
-wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-arm64.qcow2
-```
-
----
-
-# Launch QEMU
-
-Example command:
-
-```
-./build/qemu-system-x86_64 \
-  -object memory-backend-memfd,id=mem,size=2G,share=on \
-  -machine q35,memory-backend=mem \
-  -nodefaults \
-  -display none \
-  -serial none \
-  -monitor tcp:127.0.0.1:45454,server,nowait \
-  -drive id=hd0,file=/home/gvsoc/Documents/toolchain/qemu-img/debian-12-nocloud-amd64.qcow2,format=qcow2,if=none \
-  -device virtio-blk-pci,drive=hd0 \
-  -device e1000,netdev=net0 \
-  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
-  -device pcie-root-port,id=rp1 \
-  --device '{"driver":"vfio-user-pci","socket":{"type":"unix","path":"/tmp/gvsoc.sock"}}'
-```
-
-This attaches the **VFIO-user PCIe device** to the VM.
-
----
-
-# Prepare the Debian VM
-
-The Debian cloud image is minimal and requires development tools.
-
-Inside the VM install:
-
-```
-apt update
-apt install build-essential make git
-```
-
----
-
-# Access the VM
-
-```
-ssh -p 2222 root@127.0.0.1
-```
-
----
-
-# Clone Test Repository
-
-Inside the VM:
-
-```
-git clone https://github.com/TheSSDGuy/gvsoc-vfio-test
-cd gvsoc-vfio-test
+```bash
 make
 ```
 
+This produces:
+
+- `gvsoc_vfio_kernel_module.ko`
+- `dma_test`
+- `elf_loader`
+
+Kernel module build requirements:
+
+- kernel headers matching the running guest kernel
+- a working build environment (`make`, `gcc`, etc.)
+
+Typical install on Debian guest:
+
+```bash
+apt update
+apt install build-essential make linux-headers-$(uname -r)
+```
+
 ---
 
-# Load the Kernel Module
+## Device Node
 
+The kernel module registers the miscdevice as:
+
+```text
+/dev/gvsoc
 ```
+
+Both userspace tools now use `/dev/gvsoc` by default.
+
+---
+
+## Loading the Driver
+
+Build and load the module inside the guest:
+
+```bash
 make load
 ```
 
-This loads the VFIO bridge kernel module.
+You can verify probe success with:
+
+```bash
+dmesg | tail
+ls -l /dev/gvsoc
+```
+
+The driver should report the probed device, DMA handle, buffer size and IRQ vector.
 
 ---
 
-# Running the DMA Test
+## DMA Test Usage
 
-```
-./vfio_bridge_dma_test
+Syntax:
+
+```bash
+./dma_test [len] [card_addr] [device]
 ```
 
-This performs a DMA transaction between host memory and the simulated device.
+Arguments:
+
+- `len`: number of bytes to transfer, default `4096`
+- `card_addr`: device-local address/offset, default `0x0`
+- `device`: miscdevice path, default `/dev/gvsoc`
+
+Expected behavior:
+
+- perform one host-to-card DMA
+- perform one card-to-host DMA
+- verify that the returned buffer matches the original pattern
+- print `Round-trip OK` on success
 
 ---
 
-# Running the ELF Loader
+## ELF Loader Usage
 
+Syntax:
+
+```bash
+./elf_loader <program.elf> <base_addr> [device] [timeout_ms]
 ```
-./vfio_bridge_elf_loader <binary>
+
+Arguments:
+
+- `program.elf`: ELF32 or ELF64 image to load
+- `base_addr`: value subtracted from `p_paddr` and `e_entry` before programming the device
+- `device`: miscdevice path, default `/dev/gvsoc`
+- `timeout_ms`: DMA timeout, default `5000`
+
+Example:
+
+```bash
+./elf_loader test.elf 0xC0000000 /dev/gvsoc 5000
 ```
 
-This loads the binary into the accelerator memory through PCIe.
+On success the loader will:
 
-Typical usage:
+- DMA all PT_LOAD segments to the device
+- zero-fill BSS-like tails
+- print the detected ELF entry point
+- write `BAR0_ENTRY_POINT`
+- write `BAR0_FETCH_ENABLE = 1`
 
-```
-./vfio_bridge_elf_loader test.elf
+---
+
+## Expected System Setup
+
+Typical end-to-end setup:
+
+1. start **GVSoC** with the `pcie_vfio_bridge` model enabled
+2. start **QEMU** with the `vfio-user-pci` endpoint attached to the GVSoC UNIX socket
+3. boot the guest Linux system
+4. build and load this repository inside the guest
+5. run `dma_test` and/or `elf_loader`
+
+At a high level:
+
+```text
+GVSoC bridge <-> vfio-user socket <-> QEMU guest PCI device <-> guest driver/tools
 ```
 
 ---
 
-# Workflow Summary
+## Notes
 
-```
-Start GVSoC
-      ↓
-Start QEMU
-      ↓
-Boot Debian VM
-      ↓
-Load kernel module
-      ↓
-Run DMA tests or ELF loader
-```
-
-This environment allows development and testing of:
-
-* PCIe communication
-* DMA transfers
-* host-side drivers
-* accelerator boot flow
+- The kernel driver is intentionally minimal and single-device oriented.
+- The DMA buffer size is currently `4096` bytes in the driver.
+- The userspace loader already handles payloads larger than one DMA chunk by splitting transfers.
+- The BAR0 protocol and DMA CSR layout are expected to match the current GVSoC bridge implementation.
